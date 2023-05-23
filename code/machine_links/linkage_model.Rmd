@@ -1,0 +1,1220 @@
+---
+title: "Linking Patents to Firms I: Using Full Strings"
+author: "Terence Chau"
+output:
+  html_document:
+    toc: yes
+    code_folding: hide
+---
+
+```{r, setup, results="hide", warning=FALSE, message=FALSE}
+# Directory:
+if(Sys.info()[[1]] == "Windows"){
+  knitr::opts_knit$set(root.dir = "C:/Users/tchau/Dropbox/Work/UChicago/RA/RA Hornbeck/")
+} else {
+  knitr::opts_knit$set(root.dir = "~/Dropbox/Work/UChicago/RA/RA Hornbeck/")
+}
+```
+
+This code calculates some basic statistics about patents and establishments and takes a stab at a linking model.
+
+```{r}
+library(tidyverse)
+library(magrittr)
+library(ranger)
+library(stringdist)
+#library(kableExtra)
+library(tidytext)
+library(caret)
+library(phonics)
+
+source("CMF Micro Data/Terence Working Folders/firm_matching/code/linking_establishments/pre_processing/clean_names_functions_updating.R")
+
+cmf_patents <- read_csv("CMF Patents/Terence Working Folders/output/cmf_patents_reviewed.csv") 
+```
+
+# Baseline Handlink Match Rates
+
+Before starting with the model, first show some basic match rates between establishments and patents.
+
+```{r}
+# How many distinct establishments were linked?
+tab_estabs <- cmf_patents %>% 
+  group_by(id) %>% 
+  summarize(any_match = ifelse(sum(match >= 1), 1, 0)) %>% 
+  ungroup() %>% 
+  pull(any_match) %>% 
+  table()
+
+tab_estabs_1860 <- cmf_patents %>% 
+  filter(year == "1860") %>% 
+  group_by(id) %>% 
+  summarize(any_match = ifelse(sum(match >= 1), 1, 0)) %>% 
+  ungroup() %>% 
+  pull(any_match) %>% 
+  table()
+
+tab_estabs_1870 <- cmf_patents %>% 
+  filter(year == "1870") %>% 
+  group_by(id) %>% 
+  summarize(any_match = ifelse(sum(match >= 1), 1, 0)) %>% 
+  ungroup() %>% 
+  pull(any_match) %>% 
+  table()
+
+# How many distinct patents were linked?
+tab_patents <- cmf_patents %>% 
+  group_by(patent_number) %>% 
+  summarize(any_match = ifelse(sum(match >= 1), 1, 0)) %>% 
+  ungroup() %>% 
+  pull(any_match) %>% 
+  table()
+
+tab_patents_1860 <- cmf_patents %>% 
+  filter(year == "1860") %>% 
+  group_by(patent_number) %>% 
+  summarize(any_match = ifelse(sum(match >= 1), 1, 0)) %>% 
+  ungroup() %>% 
+  pull(any_match) %>% 
+  table()
+
+tab_patents_1870 <- cmf_patents %>% 
+  filter(year == "1870") %>% 
+  group_by(patent_number) %>% 
+  summarize(any_match = ifelse(sum(match >= 1), 1, 0)) %>% 
+  ungroup() %>% 
+  pull(any_match) %>% 
+  table()
+```
+
+
+Overall, the number of matched establishments is `r tab_estabs[2]` out of `r tab_estabs[1] + tab_estabs[2]`, or `r round(100 * tab_estabs[2]/(tab_estabs[1] + tab_estabs[2]), 3)`%. As for patents, `r tab_patents[2]` out of `r tab_patents[1] + tab_patents[2]`, or `r round(100 * tab_patents[2]/(tab_patents[1] + tab_patents[2]), 3)`% were matched.
+
+Grouping by year, the number of matched 1860 establishments was `r tab_estabs_1860[2]` out of `r tab_estabs_1860[1] + tab_estabs_1860[2]`, or `r round(100 * tab_estabs_1860[2]/(tab_estabs_1860[1] + tab_estabs_1860[2]), 3)`%. Also, `r tab_patents_1860[2]` out of `r tab_patents_1860[1] + tab_patents_1860[2]` (`r round(100 * tab_patents_1860[2]/(tab_patents_1860[1] + tab_patents_1860[2]), 3)`%) patents issued up to 1860 were matched to one of these establishments.
+
+The number of matched 1870 establishments was `r tab_estabs_1870[2]` out of `r tab_estabs_1870[1] + tab_estabs_1870[2]`, or `r round(100 * tab_estabs_1870[2]/(tab_estabs_1870[1] + tab_estabs_1870[2]), 3)`%. `r tab_patents_1870[2]` out of `r tab_patents_1870[1] + tab_patents_1870[2]` (`r round(100 * tab_patents_1870[2]/(tab_patents_1870[1] + tab_patents_1870[2]), 3)`%) of patents issued up to 1870 were matched to one of these establishments.
+
+These match rates are fairly low, but it's worth considering that patent counts are highly correlated with establishment counts overall, and we'd expect match rates to be higher in larger counties.
+
+# Characteristics of Matches in Handlinked Data
+
+For now, treat all handlinked data as one large dataset, but we could also train year specific models.
+
+The handlinked data consists of 48 counties randomly drawn from the subset of all counties that had over 95% completeness in industry and name strings. Of these, 14 had no patents issued or assigned to them in any year up to the Census year. The remaining 34 were augmented with 3 counties that were handpicked because they had high patent to establishment ratios in the remaining data. So the counties in this handlinked sample are not randomly drawn from the overall Census of Manufactures. 
+
+In total, this handlinked sample consists of $N = 2755$ establishments and $P = 1636$ patents. Because the range of possible establishment-patent links is blocked on county for each year, the total size of the available training data is not $N \times P$. Accounting for this blocking, the resulting handlinked dataset is of size $324514$.
+
+
+```{r}
+county_matches <- cmf_patents %>% 
+  group_by(fips) %>% 
+  summarize(match_count = sum(match),
+            establishment_count = length(unique(id)),
+            patent_count = length(unique(patent_number)),
+            .groups = "keep") %>% 
+  ungroup() 
+
+# match_count <- table(county_matches$match_count) %>% 
+#   data.frame() %>% 
+#   rename("Match Count" = Var1, 
+#          "Frequency" = Freq) %>% 
+#   kable(format = "latex",
+#         booktabs = TRUE,
+#         align = "lc") %>% 
+#   kable_styling()
+```
+
+First, in this sample of counties, one can see that matches are highly concentrated. Out of 37, 26 have no matches at all. Of the remaining 11, 8 have less than 10 matches, and the remaining 3 have 13, 99, and 350 matches, respectively.
+
+Do the characteristics of these handlinks make broad sense?
+
+```{r}
+cmf_patents %>% 
+  group_by(patent_number) %>% 
+  summarize(has_assignee = any(!is.na(assignee_name)|assignee_name != ""),
+            .groups = "keep") %>% 
+  ungroup() %>% 
+  pull(has_assignee) %>% 
+  sum(na.rm = TRUE)/length(unique(cmf_patents$patent_number))
+```
+
+Several cleaning steps need to be taken first. First, some names in the Census of Manufactures were entered last name first\footnote{Names that imply partnerships or incorporated firms are excluded from this cleaning step.}, particularly in 1870, while inventor and assignee names are generally ordered first name first. There are two potential ways to correct for this. The first is to use the name orderings in the patents. One can create a reordered version of an establishment's name and compare the original and reordered names to the target patent name and keep the closest. The second alternative is to rely on additional data from the Census of Population (Ruggles et al., 2021) where the names have already been split into first and last names. Using name frequencies from this data, one can predict whether any given token in an establishment is a first or last name and order accordingly. Because the first approach doesn't rely on extra data, we'll rely on the first.
+
+Second, because patents can be linked either through inventors or through assignees, one needs to choose a target name to compare the establishment name against. A 2-to-1 comparison can't be made because only 17.73% of the handlinked patents (23.16% in all 1840-1900 patents) have assignees. Using both names could also confuse a learner given that usually only one name is expected to match. For example, if the establishment name is "Terence Chau" and there is a patent invented by "Anders Humlum" and assigned to "Terence Chau", the model would observe one name that matches exactly and one that is completely different. Any transformation of these two distances into one scalar value dilutes the signal we'd like the learner to pick up—that matching names imply a higher match probability. Therefore, to select a target name, we take the Jaro-Winkler distance between inventor and assignee names to the establishment name, and choose the closest. For consistency, we use the city that corresponds to the selected target name as well.
+
+These two cleaning steps appear to be at odds with each other, because choosing a target patent name out of the two changes the distance between the potential establishment name orderings, which can change the patent name, and so forth. To deal with this, we take the four distances:
+
+\begin{enumerate}
+  \item Establishment name, original ordering - inventor name.
+  \item Establishment name, inverted ordering - inventor name. 
+  \item Establishment name, original ordering - assignee name.
+  \item Establishment name, inverted ordering - assignee name.
+\end{enumerate}
+
+Then, take the names that correspond to the minimum distance of the four as our target establishment and patent names.
+
+```{r}
+# Modify invert_name function to also try permutations of company style names
+invert_name <- function(string){
+  # Split string, count words and initials
+  split <- strsplit(string, "\\s+")[[1]]
+  initials_loc <- grepl("\\b\\w\\b", split)
+  initials <- split[initials_loc]
+  initial_count <- length(initials)
+  words <- split[!initials_loc]
+  word_count <- length(words)
+  
+  # Inversion rules:
+  # - Two token names have initials at the beginning always.
+  # - Names with more than two tokens and one initial have the initial after
+  # the first word, i.e., assume it's a middle name initial.
+  # - Names with more than two tokens and more than one initial have the initials
+  # at the beginning of the string, i.e., assume they're first name and middle
+  # name initials
+  
+  if(word_count == 2 & initial_count == 0){
+    return(paste(rev(words), collapse = " "))
+  } else if(word_count == 1 & initial_count == 1){
+    return(paste(initials, words, collapse = " "))
+  } else if(word_count > 1 & initial_count == 1){
+    return(paste(words[length(words)], initials, paste(words[-length(words)], collapse = " "), collapse = " "))
+  } else if(word_count >= 1 & initial_count > 1){
+    return(paste(paste(initials, collapse = " "), paste(words, collapse = " ")))
+  } else {
+    return(string)
+  }
+}
+```
+
+
+```{r}
+cmf_patents %<>%
+  mutate(establishment_name = clean_string(establishment_name, alphanum_only = FALSE),
+         establishment_name = tolower(establishment_name),
+         inventor_name = clean_string(inventor_name, alphanum_only = FALSE),
+         inventor_name = tolower(inventor_name),
+         assignee_name = clean_string(assignee_name, alphanum_only = FALSE),
+         assignee_name = tolower(assignee_name),
+         company_name = ifelse(!proper_name(establishment_name), 1, 0))
+
+cmf_patents %<>% 
+  rowwise() %>% 
+  mutate(establishment_name_inverted = invert_name(establishment_name))
+```
+
+```{r}
+system.time({
+cmf_patents$jw_1 <- mean_jw(cmf_patents$establishment_name, 
+                            cmf_patents$inventor_name)
+cmf_patents$jw_2 <- mean_jw(cmf_patents$establishment_name_inverted, 
+                            cmf_patents$inventor_name)
+cmf_patents$jw_3 <- mean_jw(cmf_patents$establishment_name, 
+                            cmf_patents$assignee_name)
+cmf_patents$jw_4 <- mean_jw(cmf_patents$establishment_name_inverted, 
+                            cmf_patents$assignee_name)
+})
+```
+
+```{r}
+cmf_patents %<>%
+  mutate(jw_min = min(jw_1, jw_2, jw_3, jw_4, na.rm = TRUE),
+         establishment_name_target = case_when(jw_min == jw_1|jw_min == jw_3 ~ establishment_name,
+                                               jw_min == jw_2|jw_min == jw_4 ~ establishment_name_inverted,
+                                               TRUE ~ as.character(NA)),
+         patent_name_target = case_when(jw_min == jw_1|jw_min == jw_2 ~ inventor_name,
+                                        jw_min == jw_3|jw_min == jw_4 ~ assignee_name,
+                                        TRUE ~ as.character(NA)),
+         patent_city = case_when(jw_min == jw_1|jw_min == jw_2 ~ inventor_city,
+                                 jw_min == jw_3|jw_min == jw_4 ~ assignee_city,
+                                 TRUE ~ as.character(NA)))
+
+# foo <- cmf_patents %>% 
+#   select(establishment_name, establishment_name_inverted, inventor_name, assignee_name, 
+#          establishment_name_target, patent_name_target,
+#          jw_1, jw_2, jw_3, jw_4, jw_min)
+```
+
+```{r}
+system.time({
+# Clean up strings, pick right target names
+cmf_patents %<>%
+  select(-c(establishment_name, establishment_name_inverted, inventor_name, 
+            assignee_name, inventor_city, assignee_city)) %>% 
+  rename(establishment_name = establishment_name_target,
+         patent_name = patent_name_target) %>% 
+  mutate(match = as.factor(match),
+         post_office = tolower(post_office),
+         patent_year = lubridate::year(disposal_date))
+
+# Generate distance measures
+cmf_patents$mean_jw_name <- mean_jw(cmf_patents$establishment_name, 
+                                    cmf_patents$patent_name)
+cmf_patents$mean_jw_city <- mean_jw(cmf_patents$post_office, 
+                                   cmf_patents$patent_city)
+
+cmf_patents %<>%
+  mutate(jw_name = stringdist(establishment_name, patent_name, method = "jw", p = 0.1),
+         mean_jw_name = ifelse(is.na(jw_name), NA, mean_jw_name),
+         jw_city = stringdist(post_office, patent_city, method = "jw", p = 0.1),
+         mean_jw_city = ifelse(is.na(jw_city), NA, mean_jw_city),
+         year_gap = year - patent_year)
+
+cmf_patents$per_token_jw_name <- calculate_per_token_jw(cmf_patents$establishment_name,
+                                            cmf_patents$patent_name) 
+
+# Recode undetectable matches to not confuse the model
+cmf_patents %<>%
+  mutate(match = ifelse(detectable == 0, 0, match))
+})
+```
+
+```{r}
+cmf_patents %>% 
+  filter(match == 1) %>% 
+  select(jw_name, mean_jw_name, per_token_jw_name, company_name,
+         jw_city, mean_jw_city, year_gap) %>% 
+  summary()
+```
+
+```{r}
+cmf_patents %>% 
+  filter(match == 0) %>% 
+  select(jw_name, mean_jw_name, per_token_jw_name, company_name, jw_city,
+         mean_jw_city, year_gap) %>% 
+  summary()
+```
+
+```{r}
+cmf_patents %>% 
+  filter(match == 1) %>% 
+  arrange(fips, year, establishment_name, id, patent_name, patent_number)
+
+duplicate_patents <- cmf_patents %>% 
+  filter(match == 1) %>% 
+  group_by(patent_number) %>% 
+  filter(n() > 1) %>% 
+  ungroup()
+```
+
+# Train-test Split
+
+Draw by firm blocks, ignoring year. The handlinking sampling is done by county, not year, as the linking criteria didn't vary by year when handlinking.
+
+```{r}
+cmf_patents %<>% mutate(match = factor(match, levels = c("0", "1")))
+
+set.seed(60615)
+
+train_firms <- cmf_patents %>%
+ mutate(match = ifelse(match == "1", 1, 0)) %>% 
+ group_by(id) %>%
+ summarize(n = n(),
+           n_matches = sum(match)) %>%
+ slice_sample(prop = 1) %>%
+ mutate(cumulative_n = cumsum(n),
+        cumulative_matches = cumsum(n_matches),
+        total = sum(n),
+        total_matches = sum(n_matches),
+        share = cumulative_n/total,
+        share_matches = cumulative_matches/total_matches,
+        dataset = case_when(share_matches <= 0.7 ~ "train",
+                            share_matches > 0.7 & share_matches <= 0.85 ~ "validation",
+                            share_matches > 0.85 ~ "test",
+                            TRUE ~ as.character(NA)))
+
+train_firm_ids <- train_firms %>%
+ filter(dataset == "train") %>%
+ pull(id)
+
+val_firm_ids <- train_firms %>%
+ filter(dataset == "validation") %>%
+ pull(id)
+
+test_firm_ids <- train_firms %>%
+ filter(dataset == "test") %>%
+ pull(id)
+
+train <- cmf_patents %>%
+ filter(id %in% train_firm_ids)
+
+validation <- cmf_patents %>%
+ filter(id %in% val_firm_ids)
+
+test <- cmf_patents %>%
+ filter(id %in% test_firm_ids)
+
+table(train$match)
+table(validation$match)
+table(test$match)
+```
+
+Given some missing values, impute means (using only train) or blanks and add missing flags. Also update industry broad with latest values.
+
+```{r}
+# Add new industry classifications
+cmf_patents_industries <- unique(cmf_patents$industry_raw)
+
+industry_crosswalk <- read_csv("CMF Micro Data/Terence Working Folders/industry_assignment/output/industry_classification.csv")
+
+# Still missing industry_broad!
+industry_crosswalk %<>% 
+  filter(industry_raw %in% cmf_patents_industries) %>% 
+  select(industry_raw, ind_detailed) %>% 
+  rename(ind_detailed_new = ind_detailed) %>% 
+  distinct()
+
+foo <- cmf_patents %>% 
+  left_join(industry_crosswalk, by = "industry_raw") %>% 
+  mutate(industry_detailed = ifelse(is.na(industry_detailed) & !is.na(ind_detailed_new),
+                                    ind_detailed_new, industry_detailed)) %>% 
+  select(-ind_detailed_new)
+
+# Get training data means of variables for imputation
+train_jw_city_mean <- mean(train$jw_city, na.rm = TRUE)
+train_mean_jw_city_mean <- mean(train$mean_jw_city, na.rm = TRUE)
+
+# Make missing flags and impute
+train %<>%
+  mutate(industry_broad_miss = ifelse(is.na(industry_broad), 1, 0),
+         industry_broad = ifelse(is.na(industry_broad), "", industry_broad),
+         industry_detailed_miss = ifelse(is.na(industry_detailed), 1, 0),
+         industry_detailed = ifelse(is.na(industry_detailed), "", industry_detailed),
+         jw_city_miss = ifelse(is.na(jw_city), 1, 0),
+         jw_city = ifelse(is.na(jw_city), 
+                          train_jw_city_mean, 
+                          jw_city),
+         mean_jw_city_miss = ifelse(is.na(mean_jw_city), 1, 0),
+         mean_jw_city = ifelse(is.na(mean_jw_city), 
+                               train_mean_jw_city_mean, 
+                               mean_jw_city))
+
+validation %<>%
+  mutate(industry_broad_miss = ifelse(is.na(industry_broad), 1, 0),
+         industry_broad = ifelse(is.na(industry_broad), "", industry_broad),
+         industry_detailed_miss = ifelse(is.na(industry_detailed), 1, 0),
+         industry_detailed = ifelse(is.na(industry_detailed), "", industry_detailed),
+         jw_city_miss = ifelse(is.na(jw_city), 1, 0),
+         jw_city = ifelse(is.na(jw_city), 
+                          train_jw_city_mean, 
+                          jw_city),
+         mean_jw_city_miss = ifelse(is.na(mean_jw_city), 1, 0),
+         mean_jw_city = ifelse(is.na(mean_jw_city), 
+                               train_mean_jw_city_mean, 
+                               mean_jw_city))
+
+test %<>%
+  mutate(industry_broad_miss = ifelse(is.na(industry_broad), 1, 0),
+         industry_broad = ifelse(is.na(industry_broad), "", industry_broad),
+         industry_detailed_miss = ifelse(is.na(industry_detailed), 1, 0),
+         industry_detailed = ifelse(is.na(industry_detailed), "", industry_detailed),
+         jw_city_miss = ifelse(is.na(jw_city), 1, 0),
+         jw_city = ifelse(is.na(jw_city), 
+                          train_jw_city_mean, 
+                          jw_city),
+         mean_jw_city_miss = ifelse(is.na(mean_jw_city), 1, 0),
+         mean_jw_city = ifelse(is.na(mean_jw_city), 
+                               train_mean_jw_city_mean, 
+                               mean_jw_city))
+```
+
+# Baseline
+
+Train a baseline model. First, prep data:
+
+```{r}
+non_model_variables <- c("fips", "year", "establishment_name", "patent_name",
+                         "industry_raw", "materials", "products", "power_kind", 
+                         "post_office", "patent_city",
+                         "file_name", "firm_number", "patent_number", 
+                         "disposal_date", "id", "patent_year", "county_type",
+                         "detectable", "jw_min", "jw_1", "jw_2", "jw_3", "jw_4")
+
+model_train <- train %>% 
+  select(-all_of(non_model_variables)) %>% 
+  select(match, everything()) %>% 
+  mutate(across(where(is.character), as.factor))
+model_test <- test %>% 
+  select(-all_of(non_model_variables)) %>% 
+  select(match, everything()) %>% 
+  mutate(across(where(is.character), as.factor))
+model_validation <- validation %>% 
+  select(-all_of(non_model_variables)) %>% 
+  select(match, everything()) %>% 
+  mutate(across(where(is.character), as.factor))
+
+# Transform unseen factor levels in test to "" because the model won't know them
+factors <- c("industry_detailed", "industry_broad",
+             "uspc_class", "nber_subclass_name", "nber_name")
+
+unseen_val <- lapply(factors, function(x){
+  unseen_levels <- setdiff(levels(model_validation[, x]), levels(model_train[, x]))
+})
+
+for (i in seq_along(factors)){
+  levels(model_validation[, factors[i]])[which(levels(model_validation[, factors[i]]) %in% unseen_val[[i]])] <- ""
+}
+
+unseen_test <- lapply(factors, function(x){
+  unseen_levels <- setdiff(levels(model_test[, x]), levels(model_train[, x]))
+})
+
+for (i in seq_along(factors)){
+  levels(model_test[, factors[i]])[which(levels(model_test[, factors[i]]) %in% unseen_test[[i]])] <- ""
+}
+```
+
+Train a random forest:
+
+```{r, message=FALSE, warning=FALSE, results="hide"}
+rf <- ranger(match ~ ., 
+             data = model_train,
+             num.trees = 1000,
+             importance = "permutation")
+```
+
+Permutation variable importance:
+
+```{r}
+rf_importance <- importance(rf) %>% 
+  data.frame("Importance" = .) %>% 
+  arrange(-Importance)
+
+rf_importance # %>% 
+#  kable() %>% 
+#  kable_styling(bootstrap_options = c("float", "striped"))
+```
+
+Train and test set performance, where predicted classes are taken as the majority vote of all trees:
+
+```{r}
+preds_rf_train <- predict(rf, data = model_train)
+cm_rf_train <- table("Prediction" = preds_rf_train$predictions, 
+                     "Reference" = model_train$match)
+cm_rf_train
+```
+
+```{r}
+preds_rf_validation <- predict(rf, data = model_validation)
+cm_rf_validation <- table("Prediction" = preds_rf_validation$predictions, 
+                          "Reference" = model_validation$match)
+cm_rf_validation
+```
+
+# Training Without Industry and Technology
+
+Do the results change much if we don't use industry variables?
+
+```{r}
+non_model_variables_2 <- c("fips", "year", "establishment_name", "patent_name",
+                         "industry_raw", "materials", "products", "power_kind", 
+                         "post_office", "patent_city",
+                         "file_name", "firm_number", "patent_number", 
+                         "disposal_date", "id", "patent_year", "county_type",
+                         "detectable", "jw_min", "jw_1", "jw_2", "jw_3", "jw_4",
+                         "industry_detailed", "industry_broad", 
+                         "industry_broad_miss", "industry_detailed_miss",
+                         "nber_subclass_name", "nber_name")
+
+model_train_2 <- train %>% 
+  select(-all_of(non_model_variables_2)) %>% 
+  select(match, everything()) %>% 
+  mutate(across(where(is.character), as.factor))
+model_test_2 <- test %>% 
+  select(-all_of(non_model_variables_2)) %>% 
+  select(match, everything()) %>% 
+  mutate(across(where(is.character), as.factor))
+model_validation_2 <- validation %>% 
+  select(-all_of(non_model_variables_2)) %>% 
+  select(match, everything()) %>% 
+  mutate(across(where(is.character), as.factor))
+```
+
+Train a random forest:
+
+```{r, message=FALSE, warning=FALSE, results="hide"}
+rf_2 <- ranger(match ~ ., 
+             data = model_train_2,
+             num.trees = 1000,
+             importance = "permutation")
+```
+
+Permutation variable importance:
+
+```{r}
+rf_importance_2 <- importance(rf_2) %>% 
+  data.frame("Importance" = .) %>% 
+  arrange(-Importance)
+
+rf_importance_2 # %>% 
+#  kable() %>% 
+#  kable_styling(bootstrap_options = c("float", "striped"))
+```
+
+Train and test set performance, where predicted classes are taken as the majority vote of all trees:
+
+```{r}
+preds_rf_train_2 <- predict(rf_2, data = model_train_2)
+cm_rf_train_2 <- table("Prediction" = preds_rf_train_2$predictions, 
+                     "Reference" = model_train_2$match)
+cm_rf_train_2
+```
+
+```{r}
+preds_rf_validation_2 <- predict(rf_2, data = model_validation_2)
+cm_rf_validation_2 <- table("Prediction" = preds_rf_validation_2$predictions, 
+                          "Reference" = model_validation_2$match)
+cm_rf_validation_2
+```
+
+# Improving the Model
+
+First, try adding phonetic features to see if the model improves:
+
+```{r}
+compare_phonetics <- function(a, b){
+  # Only keep alphas
+  a <- clean_string(a, alphanum_only = TRUE) %>% 
+    gsub("[0-9]", "", .)
+  b <- clean_string(b, alphanum_only = TRUE) %>% 
+    gsub("[0-9]", "", .)
+  
+  # Delete company identifiers (otherwise distance is zero automatically)
+  a  <- gsub(pattern = "&|\\band\\b|\\bco\\b|\\bcompany\\b|\\bmanufacturing\\b|\\bson\\b|\\bsons\\b|\\bbro\\b|\\bbros\\b|\\bbrothers\\b", 
+             replacement = "", 
+             x = a,
+             ignore.case = TRUE)
+  b  <- gsub(pattern = "&|\\band\\b|\\bco\\b|\\bcompany\\b|\\bmanufacturing\\b|\\bson\\b|\\bsons\\b|\\bbro\\b|\\bbros\\b|\\bbrothers\\b", 
+             replacement = "", 
+             x = b,
+             ignore.case = TRUE)
+  
+  # Remove initials (they're too likely to generate zero distances)
+  a <- gsub(pattern = "\\b[A-Za-z]\\b", replacement = "", x = a) %>% 
+    str_trim(side = "both") %>% 
+    str_squish()
+  b <- gsub(pattern = "\\b[A-Za-z]\\b", replacement = "", x = b) %>% 
+    str_trim(side = "both") %>% 
+    str_squish()
+  
+  # Get phonetic codes for all tokens in both string vectors
+  phonetics_a <- lapply(strsplit(a, "\\s+"), function(string){
+    if (is_empty(string)){
+      string <- ""
+    } else {
+      metaphone(string)
+    }
+  })
+  
+  phonetics_b <- lapply(strsplit(b, "\\s+"), function(string){
+    if (is_empty(string)){
+      string <- ""
+    } else {
+      metaphone(string)
+    }
+  })
+  
+  # Check if any codes match, take average of all matches
+  code_match_all <- sapply(seq_along(phonetics_a), function(i){
+    mean(ifelse(phonetics_a[[i]] %in% phonetics_b[[i]], 1, 0))
+  })
+}
+```
+
+
+```{r}
+non_model_variables_3 <- c("fips", "year", "establishment_name", "patent_name",
+                         "industry_raw", "materials", "products", "power_kind", 
+                         "post_office", "patent_city",
+                         "file_name", "firm_number", "patent_number", 
+                         "disposal_date", "id", "patent_year", "county_type",
+                         "detectable", "jw_min", "jw_1", "jw_2", "jw_3", "jw_4",
+                         "industry_detailed", "industry_broad",
+                         "nber_subclass_name", "nber_name", "uspc_class")
+
+model_train_3 <- train %>% 
+  mutate(name_phonetic = compare_phonetics(establishment_name, patent_name),
+         city_phonetic = compare_phonetics(post_office, patent_city)) %>% 
+  select(-all_of(non_model_variables_3)) %>% 
+  select(match, everything()) %>% 
+  mutate(across(where(is.character), as.factor))
+model_test_3 <- test %>% 
+  mutate(name_phonetic = compare_phonetics(establishment_name, patent_name),
+         city_phonetic = compare_phonetics(post_office, patent_city)) %>% 
+  select(-all_of(non_model_variables_3)) %>% 
+  select(match, everything()) %>% 
+  mutate(across(where(is.character), as.factor))
+model_validation_3 <- validation %>% 
+  mutate(name_phonetic = compare_phonetics(establishment_name, patent_name),
+         city_phonetic = compare_phonetics(post_office, patent_city)) %>% 
+  select(-all_of(non_model_variables_3)) %>% 
+  select(match, everything()) %>% 
+  mutate(across(where(is.character), as.factor))
+```
+
+Train a random forest:
+
+```{r, message=FALSE, warning=FALSE, results="hide"}
+rf_3 <- ranger(match ~ ., 
+             data = model_train_3,
+             num.trees = 1000,
+             importance = "permutation")
+```
+
+Permutation variable importance:
+
+```{r}
+rf_importance_3 <- importance(rf_3) %>% 
+  data.frame("Importance" = .) %>% 
+  arrange(-Importance)
+
+rf_importance_3 # %>% 
+#  kable() %>% 
+#  kable_styling(bootstrap_options = c("float", "striped"))
+```
+
+Train and validation set performance, where predicted classes are taken as the majority vote of all trees:
+
+```{r}
+preds_rf_train_3 <- predict(rf_3, data = model_train_3)
+cm_rf_train_3 <- table("Prediction" = preds_rf_train_3$predictions, 
+                     "Reference" = model_train_3$match)
+cm_rf_train_3
+```
+
+```{r}
+preds_rf_validation_3 <- predict(rf_3, data = model_validation_3)
+cm_rf_validation_3 <- table("Prediction" = preds_rf_validation_3$predictions, 
+                          "Reference" = model_validation_3$match)
+cm_rf_validation_3
+```
+
+# Best Specification
+
+The best specification was 2 (RF, no industry FE), so evaluate test set performance of that
+
+Retrain:
+
+```{r}
+big_train <- bind_rows(model_train_2, model_validation_2)
+rf_final <- ranger(match ~ ., 
+             data = big_train,
+             num.trees = 1000,
+             importance = "permutation")
+```
+
+```{r}
+rf_importance_final <- importance(rf_final) %>% 
+  data.frame("Importance" = .) %>% 
+  arrange(-Importance)
+
+rf_importance_final # %>% 
+#  kable() %>% 
+#  kable_styling(bootstrap_options = c("float", "striped"))
+```
+
+```{r}
+preds_rf_train_final <- predict(rf_final, data = big_train)
+cm_rf_train_final <- table("Prediction" = preds_rf_train_final$predictions, 
+                     "Reference" = big_train$match)
+cm_rf_train_final
+```
+
+```{r}
+preds_rf_test_final <- predict(rf_final, data = model_test_2)
+cm_rf_test_final <- table("Prediction" = preds_rf_test_final$predictions, 
+                          "Reference" = model_test_2$match)
+cm_rf_test_final
+```
+
+```{r}
+# Define performance metric functions
+tpr <- function(cm){
+  cm[2, 2]/(sum(cm[, 2]))
+}
+
+tnr <- function(cm){
+  cm[1, 1]/(sum(cm[, 1]))
+}
+
+ppv <- function(cm){
+  cm[2, 2]/(sum(cm[2, ]))
+}
+
+f_score <- function(cm){
+  (2*tpr(cm) * ppv(cm))/(tpr(cm) + ppv(cm))
+}
+
+kappa <- function(cm){
+  n <- sum(cm)
+  p_o <- sum(diag(cm))/n
+  p_rpa <- (sum(cm[2, ]))/n * (sum(cm[, 2]))/n
+  p_rna <- (sum(cm[1, ]))/n * (sum(cm[, 1]))/n
+  p_r <- p_rpa + p_rna
+  (p_o - p_r)/(1 - p_r)
+}
+```
+
+```{r}
+tpr(cm_rf_test_final)
+tnr(cm_rf_test_final)
+ppv(cm_rf_test_final)
+f_score(cm_rf_test_final)
+kappa(cm_rf_test_final)
+```
+
+# Tuning
+
+Check if specification 2 can be improved with tuning
+
+```{r}
+library(tuneRanger)
+
+link_task <- makeClassifTask(data = model_train_2, target = "match")
+estimateTimeTuneRanger(link_task)
+```
+
+```{r}
+system.time({
+tuned_rf <- tuneRanger(link_task, measure = list(multiclass.brier), num.trees = 1000)
+})
+```
+
+
+```{r}
+rf_tuned <- ranger(match ~ ., 
+             data = big_train,
+             num.trees = 1000,
+             mtry = 4,
+             min.node.size = 2,
+             sample.fraction = 0.8394891,
+             importance = "permutation")
+```
+
+```{r}
+rf_importance_tuned <- importance(rf_tuned) %>% 
+  data.frame("Importance" = .) %>% 
+  arrange(-Importance)
+
+rf_importance_tuned # %>% 
+#  kable() %>% 
+#  kable_styling(bootstrap_options = c("float", "striped"))
+```
+
+```{r}
+preds_rf_train_tuned <- predict(rf_tuned, data = big_train)
+cm_rf_train_tuned <- table("Prediction" = preds_rf_train_tuned$predictions, 
+                     "Reference" = big_train$match)
+cm_rf_train_tuned
+```
+
+```{r}
+preds_rf_test_tuned <- predict(rf_tuned, data = model_test_2)
+cm_rf_test_tuned <- table("Prediction" = preds_rf_test_tuned$predictions, 
+                          "Reference" = model_test_2$match)
+cm_rf_test_tuned
+```
+
+```{r}
+tpr(cm_rf_test_tuned)
+tnr(cm_rf_test_tuned)
+ppv(cm_rf_test_tuned)
+f_score(cm_rf_test_tuned)
+kappa(cm_rf_test_tuned)
+```
+
+
+# Some extra models
+
+Train a logit on specification 2
+
+```{r}
+system.time({
+logit_2 <- glm(match ~ ., family = "binomial", data = big_train)
+})
+```
+
+Test set performance, where predicted classes are taken as >= 0.5 probability
+
+```{r}
+preds_logit_test_2_probs <- predict(logit_2, newdata = model_test_2, type = "response")
+preds_logit_test_2 <- ifelse(preds_logit_test_2_probs >= 0.75, 1, 0)
+cm_logit_test_2 <- table("Prediction" = preds_logit_test_2, 
+                          "Reference" = model_test_2$match)
+cm_logit_test_2
+```
+
+```{r}
+tpr(cm_logit_test_2)
+tnr(cm_logit_test_2)
+ppv(cm_logit_test_2)
+f_score(cm_logit_test_2)
+kappa(cm_logit_test_2)
+```
+
+```{r}
+save.image(file = "~/Dropbox/Work/UChicago/RA/RA Hornbeck/CMF Patents/Terence Working Folders/output/linkage_model.RData")
+```
+
+
+# Next
+
+Then, try incorporating the 1880 Census information to separate CMF strings into first and last names, then using JW, phonetics, etc on each first-first last-last name comparison instead. I'll do this in a separate file since this one has gotten quite large.
+
+# Plots & Tables
+
+Extra plots for the paper
+
+Distribution of JW scores split by match category
+
+```{r}
+jw_name_dist <- cmf_patents %>% 
+  ggplot(aes(x = jw_name, fill = match, color = match)) +
+  geom_density(alpha = 0.2) +
+  theme_light() +
+  labs(x = "Jaro-Winkler Distance", y = "Density", fill = "Match", 
+       color = "Match") +
+  scale_color_manual(values = c("darkorange2", "aquamarine3")) 
+
+ggsave(filename = "CMF Patents/Terence Working Folders/output/figures/jw_density.pdf", 
+       plot = jw_name_dist, width = 7, height = 4, units = "in")
+
+jw_name_dist
+```
+
+Distribution of min JWs
+
+```{r}
+per_token_jw_dist <- cmf_patents %>% 
+  ggplot(aes(x = per_token_jw_name, fill = match, color = match)) +
+  geom_density(alpha = 0.2) +
+  theme_light() +
+  labs(x = "Minimum Jaro-Winkler Distance", y = "Density", fill = "Match", 
+       color = "Match") +
+  scale_color_manual(values = c("darkorange2", "aquamarine3")) 
+
+ggsave(filename = "CMF Patents/Terence Working Folders/output/figures/per_token_jw_density.pdf", 
+       plot = per_token_jw_dist, width = 7, height = 4, units = "in")
+
+per_token_jw_dist
+```
+
+Distribution of location JWs
+
+```{r}
+jw_city_dist <- cmf_patents %>% 
+  ggplot(aes(x = jw_city, fill = match, color = match)) +
+  geom_density(alpha = 0.2) +
+  theme_light() +
+  labs(x = "Jaro-Winkler Distance", y = "Density", fill = "Match", 
+       color = "Match") +
+  scale_color_manual(values = c("darkorange2", "aquamarine3")) 
+
+ggsave(filename = "CMF Patents/Terence Working Folders/output/figures/jw_city_density.pdf", 
+       plot = jw_city_dist, width = 7, height = 4, units = "in")
+
+jw_city_dist
+```
+
+Distribution of mean JWs
+
+```{r}
+mean_jw_city_dist <- cmf_patents %>% 
+  ggplot(aes(x = mean_jw_city, fill = match, color = match)) +
+  geom_density(alpha = 0.2) +
+  theme_light() +
+  labs(x = "Average Jaro-Winkler Distance", y = "Density", fill = "Match", 
+       color = "Match") +
+  scale_color_manual(values = c("darkorange2", "aquamarine3")) 
+
+ggsave(filename = "CMF Patents/Terence Working Folders/output/figures/mean_jw_city_density.pdf", 
+       plot = mean_jw_city_dist, width = 7, height = 4, units = "in")
+
+mean_jw_city_dist
+```
+
+Distribution of year gaps
+
+```{r}
+year_gap_dist <- cmf_patents %>% 
+  ggplot(aes(x = year_gap, fill = match, color = match)) +
+  geom_density(alpha = 0.2) +
+  theme_light() +
+  labs(x = "Year Gap", y = "Density", fill = "Match", 
+       color = "Match") +
+  scale_color_manual(values = c("darkorange2", "aquamarine3")) 
+
+ggsave(filename = "CMF Patents/Terence Working Folders/output/figures/year_gap_density.pdf", 
+       plot = year_gap_dist, width = 7, height = 4, units = "in")
+
+year_gap_dist
+```
+
+Variable importance in latex:
+
+```{r}
+importance <- rf_importance_final %>% 
+  rownames_to_column(var = "Variable") %>% 
+  kable(format = "latex",
+         booktabs = TRUE,
+         align = "lc") %>% 
+   kable_styling()
+```
+
+Distribution of technology classes over all patents
+
+```{r}
+uspc_class_dist <- table(cmf_patents$uspc_class) %>% 
+  data.frame() %>% 
+  rename(Variable = Var1,
+         Count = Freq) %>% 
+  ggplot(aes(x = Count)) +
+  geom_density(fill = "darkorange2", color = "darkorange2", alpha = 0.2) +
+  theme_light() +
+  labs(x = "Count", y = "Density")
+
+ggsave(filename = "CMF Patents/Terence Working Folders/output/figures/uspc_class_density.pdf", 
+       plot = uspc_class_dist, width = 7, height = 4, units = "in")
+
+uspc_class_dist
+```
+
+```{r}
+summary(table(cmf_patents$uspc_class) %>% data.frame() %>% pull(Freq))
+```
+
+Top 10 classes
+
+```{r}
+top_uspc <- table(cmf_patents$uspc_class) %>% 
+  data.frame() %>% 
+  rename(Variable = Var1,
+         Count = Freq) %>% 
+  arrange(-Count) %>% 
+  slice_head(n = 10) %>% 
+  kable(format = "latex",
+         booktabs = TRUE,
+         align = "lc") %>% 
+   kable_styling()
+```
+
+
+Distribution of technology classes, divided by matches:
+
+```{r}
+uspc_match_count <- cmf_patents %>% 
+  mutate(match = ifelse(match == "1", 1, 0)) %>% 
+  group_by(uspc_class) %>% 
+  summarize(match_count = sum(match),
+            .groups = "keep") %>% 
+  ungroup()
+
+top_uspc_matched <- uspc_match_count %>% 
+  arrange(-match_count) %>% 
+  slice_head(n = 10) %>% 
+  kable(format = "latex",
+         booktabs = TRUE,
+         align = "lc") %>% 
+   kable_styling()
+```
+
+Summarize predictions
+
+```{r}
+test_with_preds <- data.frame(test, "preds" = preds_rf_test_final$predictions)
+
+test_with_preds %>% 
+  group_by(id) %>% 
+  summarize(any_match = any(match == "1"),
+            .groups = "keep") %>% 
+  ungroup() %>% 
+  pull(any_match) %>% 
+  table()
+
+test_with_preds %>% 
+  group_by(patent_number) %>% 
+  summarize(any_match = any(match == "1"),
+            .groups = "keep") %>% 
+  ungroup() %>% 
+  pull(any_match) %>% 
+  table()
+```
+
+Firm-level match count distribution
+
+```{r}
+firm_match_count_dist <- train_firms %>% 
+  ggplot(aes(x = n_matches)) +
+  geom_density()
+
+firm_match_count <- table(train_firms$n_matches) %>% 
+  data.frame() %>% 
+  rename("Match Count" = Var1, 
+         "Frequency" = Freq) %>% 
+  kable(format = "latex",
+        booktabs = TRUE,
+        align = "lc") %>% 
+  kable_styling()
+```
+
+Most matched industries?
+
+```{r}
+industry_match_count <- cmf_patents %>% 
+  mutate(match = ifelse(match == "1", 1, 0)) %>% 
+  group_by(industry_broad) %>% 
+  summarize(match_count = sum(match),
+            .groups = "keep") %>% 
+  ungroup()
+
+top_ind_matched <- industry_match_count %>% 
+  arrange(-match_count) %>% 
+  slice_head(n = 11) %>% 
+  kable(format = "latex",
+         booktabs = TRUE,
+         align = "lc") %>% 
+   kable_styling()
+```
+
+String distance robustness
+
+```{r}
+jaro <- stringdist(cmf_patents$establishment_name, cmf_patents$patent_name,
+                  method = "jw", p = 0)
+lev <- stringdist(cmf_patents$establishment_name, cmf_patents$patent_name,
+                  method = "lv")
+lev <- lev/max(nchar(cmf_patents$establishment_name), nchar(cmf_patents$patent_name))
+
+cor(cmf_patents$jw_name, jaro)
+cor(cmf_patents$jw_name, lev)
+```
+
+
+# XGBoost
+
+Write some XGBoost code to run on AWS
+
+```{r, eval = FALSE}
+# load("~/Dropbox/Work/UChicago/RA/RA Hornbeck/CMF Patents/Terence Working Folders/output/linkage_model.RData")
+
+library(tidyverse)
+library(caret)
+
+train_control <- trainControl(method = "cv", 
+                              number = 5,
+                              allowParallel = TRUE)
+
+set.seed(60615)
+system.time({
+xgb_2 <- train(match ~ ., 
+                 data = model_train_2, 
+                 method = "xgbTree",
+                 trControl = train_control,
+                 metric = "Kappa")
+})
+
+save.image(file = "~/Dropbox/Work/UChicago/RA/RA Hornbeck/CMF Patents/Terence Working Folders/output/linkage_model_xgb.RData")
+
+set.seed(60615)
+system.time({
+xgb_3 <- train(match ~ ., 
+                 data = model_train_3, 
+                 method = "xgbTree",
+                 trControl = train_control,
+                 metric = "Kappa")
+})
+
+save.image(file = "~/Dropbox/Work/UChicago/RA/RA Hornbeck/CMF Patents/Terence Working Folders/output/linkage_model_xgb_2.RData")
+
+preds_xgb_2 <- predict(xgb_2, 
+                       newdata = model_validation_2, 
+                       type = "class")
+
+preds_xgb_3 <- predict(xgb_3, 
+                       newdata = model_validation_3, 
+                       type = "class")
+
+cm_xgb_validation_2 <- table("Prediction" = preds_xgb_2, 
+                          "Reference" = model_validation_2$match)
+
+cm_xgb_validation_3 <- table("Prediction" = preds_xgb_3, 
+                          "Reference" = model_validation_3$match)
+
+if (kappa(cm_xgb_validation_2) >= kappa(cm_xgb_validation_3)){
+  best_model <- 2
+  best_tune <- xgb_2$bestTune
+} else {
+  best_model <- 3
+  best_tune <- xgb_3$bestTune
+}
+
+train_control_final <- trainControl(method = "none", 
+                              allowParallel = TRUE)
+
+tune_grid <- expand.grid(
+  nrounds = best_tune$nrounds,
+  eta = best_tune$eta,
+  max_depth = best_tune$max_depth,
+  gamma = best_tune$gamma,
+  colsample_bytree = best_tune$colsample_bytree,
+  min_child_weight = best_tune$min_child_weight,
+  subsample = best_tune$subsample
+  )
+
+set.seed(60615)
+system.time({
+xgb_final <- train(match ~ ., 
+                 data = big_train, 
+                 method = "xgbTree",
+                 trControl = train_control_final,
+                 tuneGrid = tune_grid,
+                 metric = "Kappa",
+                 )
+})
+
+save.image(file = "~/Dropbox/Work/UChicago/RA/RA Hornbeck/CMF Patents/Terence Working Folders/output/linkage_model_xgb_3.RData")
+
+if (best_model == 2){
+  preds_xgb_final <- predict(xgb_final, 
+                       newdata = model_test_2, 
+                       type = "class")
+  cm_xgb_test_final <- table("Prediction" = preds_xgb_final, 
+                          "Reference" = model_test_2$match)
+} else {
+  preds_xgb_final <- predict(xgb_final, 
+                       newdata = model_test_3, 
+                       type = "class")
+  cm_xgb_test_final <- table("Prediction" = preds_xgb_final, 
+                          "Reference" = model_test_3$match)
+}
+
+tpr_xgb <- tpr(cm_xgb_test_final)
+tnr_xgb <- tnr(cm_xgb_test_final)
+ppv_xgb <- ppv(cm_xgb_test_final)
+f_xgb <- f_score(cm_xgb_test_final)
+kappa_xgb <- kappa(cm_xgb_test_final)
+
+save.image(file = "~/Dropbox/Work/UChicago/RA/RA Hornbeck/CMF Patents/Terence Working Folders/output/linkage_model_xgb_4.RData")
+```
+
+# Train final model
+
+```{r}
+big_train_2 <- bind_rows(model_train_2, model_validation_2, model_test_2)
+
+# Reimpute training mean
+jw_city_mean_final <- mean(big_train_2$jw_city, na.rm = TRUE)
+mean_jw_city_mean_final <- mean(big_train_2$mean_jw_city, na.rm = TRUE)
+big_train_2 %<>%
+  mutate(jw_city = ifelse(jw_city_miss == 1, jw_city_mean_final, jw_city),
+         mean_jw_city = ifelse(jw_city_miss == 1, mean_jw_city_mean_final, mean_jw_city))
+
+rf_final <- ranger(match ~ ., 
+             data = big_train,
+             num.trees = 1000,
+             importance = "permutation")
+
+# Save necessary objects to apply the model
+save(rf_final, model_variable_names, jw_city_mean_final, mean_jw_city_mean_final, 
+     file = "~/Dropbox/Work/UChicago/RA/RA Hornbeck/CMF Patents/Terence Working Folders/output/rf_final.RData")
+```
+

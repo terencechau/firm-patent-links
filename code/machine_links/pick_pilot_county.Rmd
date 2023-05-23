@@ -1,0 +1,359 @@
+---
+title: "Preliminary CMF Patent Handlinks"
+author: "Terence Chau"
+output: html_notebook
+---
+
+# Set up
+
+Load patent data up to 1870.
+
+Note: We're going to have to take into account expirations somehow, but ignore for now.
+
+```{r}
+library(tidyverse)
+library(magrittr)
+library(lubridate)
+library(haven)
+library(stringdist)
+library(openxlsx)
+
+patents <- read_csv("~/Dropbox/Work/UChicago/RA/RA Hornbeck/CMF Patents/Terence Working Folders/output/patents_1840_1900.csv") %>% 
+  filter(year(disposal_date) <= 1870)
+```
+
+Get the distribution of patent counts by counties:
+
+```{r}
+inventor_county_names <- patents %>% 
+  select(inventor_fips, inventor_county, inventor_state) %>% 
+  rename(fips = inventor_fips,
+         county = inventor_county,
+         state = inventor_state) %>% 
+  distinct() 
+
+patent_inventor_county_dist <- table(patents$inventor_fips) %>% 
+  data.frame() %>% 
+  rename(fips = Var1, 
+         n = Freq) %>% 
+  arrange(-n) %>% 
+  left_join(inventor_county_names, by = "fips") %>% 
+  select(fips, state, county, n)
+
+summary(patent_inventor_county_dist$n)
+```
+
+Do the same for assignee counties:
+
+```{r}
+assignee_county_names <- patents %>% 
+  select(assignee_fips, assignee_county, assignee_state) %>% 
+  rename(fips = assignee_fips,
+         county = assignee_county,
+         state = assignee_state) %>% 
+  distinct() 
+
+patent_assignee_county_dist <- table(patents$assignee_fips) %>% 
+  data.frame() %>% 
+  rename(fips = Var1, 
+         n = Freq) %>% 
+  arrange(-n) %>% 
+  left_join(assignee_county_names, by = "fips") %>% 
+  select(fips, state, county, n)
+
+summary(patent_assignee_county_dist$n)
+```
+
+Inventors and assignees combined:
+
+```{r}
+county_names <- bind_rows(inventor_county_names, assignee_county_names) %>% 
+  distinct()
+
+patent_county_dist <- patent_inventor_county_dist %>% 
+  select(-c(state, county)) %>% 
+  rename(inventor_count = n) %>% 
+  left_join(patent_assignee_county_dist, by = "fips") %>%
+  select(-c(state, county)) %>% 
+  rename(assignee_count = n) %>% 
+  mutate(total_count = inventor_count + assignee_count,
+         total_count = ifelse(is.na(inventor_count), assignee_count, total_count), 
+         total_count = ifelse(is.na(assignee_count), inventor_count, total_count)) %>% 
+  arrange(-total_count) %>% 
+  select(fips, total_count, inventor_count, assignee_count) %>% 
+  left_join(county_names, by = "fips") %>% 
+  select(fips, state, county, everything()) %>% 
+  arrange(-total_count)
+
+summary(patent_county_dist$total_count)
+```
+
+```{r}
+patent_county_dist
+```
+
+# Picking a First County
+
+Whatever patent-establishments links are made at this point will have to 
+be redone anyways because the patent county boundaries haven't been fixed, but
+might as well look at the pilot counties from the CMF handlinks that have been
+deduplicated.
+
+Add up patent counts (both inventor and assignee counts) within the pilot counties:
+
+```{r}
+cmf_pilot <- read_csv("~/Dropbox/Work/UChicago/RA/RA Hornbeck/CMF Micro Data/Terence Working Folders/firm_matching/output/crosswalked_counties/1860_to_1870/county_crosswalks/pilot/matching_sample_crosswalk.csv") %>% 
+  select(fips_1870, county_1870) %>% 
+  rename(fips = fips_1870,
+         county = county_1870)
+
+patent_county_dist %>% filter(fips %in% cmf_pilot$fips)
+```
+
+It doesn't seem like there was much patenting going on in the pilot CMF linking
+sample, so we'll pick a county with ~100 patents, either issued or assigned.
+Possible candidates are Newport, RI (44005), Miami, OH (39109), Lehigh, PA (42077),
+Lee, IL (17103), Dearborn, IN (18029), Kenton, KY (21117), Racine, WI (55101),
+and Sussex, NJ (34037). We can check how many establishments are in each and pick 
+accordingly.
+
+Note: Many Illinois counties are missing in the CMF, so we can discard Lee right
+away.
+
+```{r}
+cmf_1870 <- read_dta("~/Dropbox/Work/UChicago/RA/RA Hornbeck/CMF Micro Data/Vivian Working Folders/industry_assignment/estabs1870.dta") 
+
+cmf_1870 %>%
+  filter(fips %in% c(44005, 39109, 42077, 17103, 18029, 21117)) %>% 
+  count(fips)
+```
+
+Three of these counties are missing CMF data, so let's start with Dearborn.
+
+After handlinking, Dearborn yielded sets of patents linked to about 3 firms, 
+2 of which I couldn't tell apart. So maybe including USPC codes in the linking 
+sheet would help.
+
+Maybe the problem is that because the patent count distribution is so skewed,
+there will be extremely few matches for most counties.
+
+Let's try out a county with more patents.
+
+# Picking a Second County
+
+Looking at counties with around 500 patents, we see that we have way larger
+counties. Clark, Ohio (39023) has the smallest establishment to patent ratio 
+(184/473), so let's try that one next.
+
+```{r}
+cmf_1870 %>%
+  filter(fips %in% c(26163, 18097, 36011, 39023, 23005)) %>% 
+  count(fips)
+```
+
+I found lot more matches in Springfield. It seems like there was a lot more
+industrial activity in Springfield, and I think it had some patterns we'll see
+in other counties as well. For example, most inventors had many patents to 
+their name, and matching rates will basically depend on whether firms tied to
+those inventors are in the CMF or not. In fact, a quick search of William N. 
+Whiteley and James Leffel reveals that they were lifelong 
+engineers/inventors...Leffel built his first
+grist mill at age 12 (which made me reassess my life accomplishments to be 
+honest) and started designing waterwheels for soon after. He went on to outfit
+mills all over the region with his waterwheels then went on to run several
+businesses. His company still exists in name. Whiteley had about 42 patents 
+under his name by the time he died and had a pretty successful business making 
+reapers and other agricultural tools.
+
+One issue I ran into was that when there were several establishments that could 
+have been related to these inventors I wasn't able to tell them apart for the
+most part. The NBER patent class to industry mappings helped a little, but you
+can tell they're geared towards modern data...some of these patents are 
+classified as "computers/electronics", which is a stretch.
+
+Here's a summary of the match rates:
+
+```{r}
+drop_blank_rows <- function(df){
+  df[rowSums(!is.na(df)) > 0, ]
+}
+
+dearborn_in <- read_excel("/Users/terencechau/Dropbox/Work/UChicago/RA/RA Hornbeck/CMF Patents/Terence Working Folders/output/pilot_linking_sheets/fips18029_1870.xlsx",
+                          col_types = "text") %>% 
+  drop_blank_rows()
+
+springfield_oh <- read_excel("/Users/terencechau/Dropbox/Work/UChicago/RA/RA Hornbeck/CMF Patents/Terence Working Folders/output/pilot_linking_sheets/fips39023_1870.xlsx",
+                          col_types = "text") %>% 
+  drop_blank_rows()
+
+count_estabs_pats <- function(df){
+  df %<>% 
+    mutate(estab_id = paste(file_name, firm_number, sep = "_"))
+  num_estabs <- length(unique(df$estab_id))
+  num_pats <- length(unique(df$patent_number))
+  
+  num_matched_estabs <- df %>% 
+    group_by(estab_id) %>% 
+    summarize(matched = ifelse(any(same_establishment == "y"), 1, 0), 
+              .groups = "keep") %>% 
+    ungroup()
+  
+  num_matched_estabs <- sum(num_matched_estabs$matched)
+  
+  num_matched_pats <- df %>% 
+    group_by(patent_number) %>% 
+    summarize(matched = ifelse(any(same_establishment == "y"), 1, 0), 
+              .groups = "keep") %>% 
+    ungroup()
+  
+  num_matched_pats <- sum(num_matched_pats$matched)
+  
+  data.frame("num_estabs" = num_estabs, 
+             "num_matched_estabs" = num_matched_estabs,
+             "num_pats" = num_pats,
+             "num_matched_pats" = num_matched_pats)
+}
+```
+
+```{r}
+count_estabs_pats(dearborn_in)
+```
+
+```{r}
+count_estabs_pats(springfield_oh)
+```
+
+# Linking Sheet Code
+
+Make a linking sheet. Note: this is prototype code to scale these sheets up too!
+
+```{r, eval = FALSE}
+fips_code <- "39023"
+year <- "1870"
+linking_sheet_folder <- "~/Dropbox/Work/UChicago/RA/RA Hornbeck/CMF Patents/Terence Working Folders/output/pilot_linking_sheets/"
+linking_sheet_path <- paste0(linking_sheet_folder, "fips", fips_code, "_", year, ".xlsx")
+
+cmf_1870_county <- cmf_1870 %>%
+  mutate(fips = as.character(fips),
+         fips = str_pad(fips, width = 5, side = "left", pad = "0")) %>% 
+  filter(fips == fips_code) %>% 
+  select(firm_name, post_office, industry_raw1, machine_description1,
+         materials_kinds_raw1, production_kinds_raw1, file_name, firm_number) %>% 
+  rename(establishment_name = firm_name,
+         industry = industry_raw1,
+         machines = machine_description1,
+         materials = materials_kinds_raw1,
+         products = production_kinds_raw1)
+
+patents_county <- patents %>% 
+  filter(inventor_fips == fips_code|assignee_fips == fips_code) %>% 
+  mutate(county_type = ifelse(inventor_fips == fips_code, 
+                                       "inventor", "assignee"))
+
+# Make linking sheet, get Jaro-Winkler, sort
+linking_sheet <- merge(cmf_1870_county, patents_county, all = TRUE) %>% 
+  mutate(same_establishment = "",
+         jaro_winkler = stringdist(establishment_name, inventor_name,
+                                   method = "jw", p = 0.1)) %>% 
+  arrange(establishment_name, file_name, firm_number, jaro_winkler,
+          inventor_name, assignee_name, patent_number) %>% 
+  select(same_establishment, 
+         establishment_name, inventor_name, assignee_name, # name variables
+         county_type,
+         industry, nber_subclass_name, nber_name, # industry related variables
+         machines, materials, products, # industry related variables 2
+         post_office, inventor_city, assignee_city, # finer location variables
+         file_name, firm_number, patent_number, disposal_date) %>% # identifiers 
+  mutate(across(.cols = everything(), as.character))
+
+# Sheet formatting
+# Replace all NAs with blanks
+linking_sheet[is.na(linking_sheet)] <- ""
+
+# Insert blank row between each CMF establishment block
+linking_sheet %<>%
+  group_by(establishment_name, file_name, firm_number) %>%
+  do(add_row(.)) %>% 
+  ungroup()
+blank_indices <- which(rowSums(is.na(linking_sheet)) == ncol(linking_sheet))
+blanks <- matrix(data = "", nrow = length(blank_indices), ncol = ncol(linking_sheet))
+linking_sheet[blank_indices, ] <- blanks
+
+# Make Excel sheet
+write_formatted_excel <- function(df, output_path, 
+                                  has_blanks = FALSE, blank_indices = NULL){
+  # Create an Excel sheet
+  excel <- createWorkbook()
+  addWorksheet(excel, "Sheet 1")
+  writeData(excel, sheet = "Sheet 1", df)
+  
+  # Color blank rows differently
+  if (has_blanks){
+    blank_fill <- createStyle(fgFill = "gray95")
+    for (index in blank_indices){
+      addStyle(excel, "Sheet 1", blank_fill, 
+               rows = index + 1, cols = 1:ncol(df))
+    }
+  }
+  
+  # Color CMF, inventor and assignee columns differently
+  index_inventor <- str_which(colnames(df), pattern = "inventor|nber")
+  cell_fill <- createStyle(fgFill = "gray80", border = "TopBottomLeftRight", 
+                           borderColour = "darkgray")
+  for (index in index_inventor){
+    addStyle(excel, "Sheet 1", cell_fill, 
+             rows = 1:(nrow(df) + 1), cols = index)
+  }
+  
+  index_assignee <- str_which(colnames(df), pattern = "assignee")
+  cell_fill <- createStyle(fgFill = "wheat2", border = "TopBottomLeftRight", 
+                           borderColour = "darkgray")
+  for (index in index_assignee){
+    addStyle(excel, "Sheet 1", cell_fill, 
+             rows = 1:(nrow(df) + 1), cols = index)
+  }
+  
+  # Add borders
+  border_top <- createStyle(border = "Bottom", borderStyle = "medium")
+  border_top_2 <- createStyle(border = "BottomRight", borderStyle = "medium")
+  border_middle <- createStyle(border = "LeftRight", borderStyle = "medium")
+  addStyle(excel, "Sheet 1", border_top, 
+           rows = 1, cols = 1:ncol(df))
+  addStyle(excel, "Sheet 1", border_top_2, rows = 1, cols = 1)
+  addStyle(excel, "Sheet 1", border_middle, 
+           rows = 2:(nrow(df) + 1), cols = 1)
+  
+  # Fix blank row borders
+  if (has_blanks){
+    blank_fill_2 <- createStyle(fgFill = "gray95", border = "LeftRight", 
+                                borderStyle = "medium")
+    addStyle(excel, "Sheet 1", blank_fill_2, 
+             rows = (blank_indices + 1), cols = 1)
+  }
+  
+  # Freze first row
+  freezePane(excel, "Sheet 1", firstRow = TRUE)
+  
+  # Adjust column widths
+  width_vec <- apply(df, 2, function(x){
+    max(nchar(as.character(x)) + 1, na.rm = TRUE)
+  })
+  width_vec_header <- nchar(colnames(df)) + 1
+  width_vec_max <- pmax(width_vec, width_vec_header)
+  setColWidths(excel, "Sheet 1", 
+               cols = 1:ncol(df), widths = width_vec_max)
+  
+  # Export
+  saveWorkbook(excel, file = output_path, overwrite = TRUE)
+}
+  
+# write_formatted_excel(df = linking_sheet, output_path = linking_sheet_path,
+#                      has_blanks = TRUE, blank_indices = blank_indices)
+```
+
+
+
+
+
+
+

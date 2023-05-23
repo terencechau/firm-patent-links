@@ -1,0 +1,767 @@
+---
+title: "Linking Patents to Firms II: Using First and Last Names"
+author: "Terence Chau"
+output:
+  html_document:
+    toc: yes
+    code_folding: hide
+---
+
+```{r, setup, results="hide", warning=FALSE, message=FALSE}
+# Directory:
+if(Sys.info()[[1]] == "Windows"){
+  knitr::opts_knit$set(root.dir = "C:/Users/tchau/Dropbox/Work/UChicago/RA/RA Hornbeck/")
+} else {
+  knitr::opts_knit$set(root.dir = "~/Dropbox/Work/UChicago/RA/RA Hornbeck/")
+}
+```
+
+This code continues from the other patent linking model file, but looks at whether performance can be improved by disambiguating full names into first and last names using auxiliary data.
+
+```{r}
+library(tidyverse)
+library(magrittr)
+library(ranger)
+library(stringdist)
+library(tidytext)
+library(caret)
+library(phonics)
+library(ipumsr)
+library(kableExtra)
+
+source("CMF Micro Data/Terence Working Folders/firm_matching/code/linking_establishments/pre_processing/clean_names_functions_updating.R")
+
+cmf_patents <- read_csv("CMF Patents/Terence Working Folders/output/cmf_patents_reviewed.csv") 
+```
+
+# Classifying Names
+
+Load Census names and get some stats:
+
+```{r, eval = FALSE}
+census_names <- read_ipums_ddi("CMF Patents/Terence Working Folders/input/1880_census_names/ipumsi_00005.xml") %>% 
+  read_ipums_micro()
+
+colnames(census_names) <- c("last_name", "first_name")
+census_names %<>% mutate(across(.cols = everything(), .fns = tolower))
+
+number_last_names <- length(unique(census_names$last_name))
+number_first_names <- length(unique(census_names$first_name))
+shared_tokens <- length(intersect(unique(census_names$last_name), unique(census_names$first_name)))
+```
+
+There are `r number_last_names` unique last names, and `r number_first_names` unique first names. `r shared_tokens` tokens show up both as first (`r round(shared_tokens/number_first_names, 3)`) and last names (`r round(shared_tokens/number_last_names, 3)`). 
+
+First, calculate the frequency of each first and last name:
+
+```{r, eval = FALSE}
+clean_names <- function(x){
+  x <- str_replace_all(x, pattern = "[[:punct:]]|[^[:alnum:]]|[1-9]", replacement = " ")
+  x <- str_replace_all(x, pattern = "0", replacement = "o")
+  x <- str_trim(x, side = "both")
+  x <- str_squish(x)
+}
+
+census_names %<>%
+  mutate(across(.cols = everything(), .fns = clean_names))
+
+last_names <- table(census_names$last_name) %>% 
+  data.frame() %>% 
+  rename(count = Freq,
+         name = Var1)
+
+# Remove last names that are initials
+singles <- which(nchar(last_names$name) == 1)
+last_names <- last_names[-singles, ]
+
+last_names %<>% 
+  filter(name != "") %>% 
+  mutate(share = count/sum(count)) %>% 
+  arrange(-share) %>% 
+  select(-count)
+
+first_names <- table(census_names$first_name) %>% 
+  data.frame() %>% 
+  rename(count = Freq,
+         name = Var1) %>% 
+  filter(name != "") %>% 
+  mutate(share = count/sum(count)) %>% 
+  arrange(-share) %>% 
+  select(-count)
+
+# Save both tables
+# write_csv(first_names, "/Users/terencechau/Dropbox/Work/UChicago/RA/RA Hornbeck/CMF Patents/Terence Working Folders/output/name_assignments/first_names_1880.csv")
+# write_csv(last_names, "/Users/terencechau/Dropbox/Work/UChicago/RA/RA Hornbeck/CMF Patents/Terence Working Folders/output/name_assignments/last_names_1880.csv")
+
+rm(census_names)
+```
+
+Write a function that takes a token, then queries each database and returns the likeliest name type, given the distributions.
+
+```{r}
+# Reload names here because all the above code takes a long time
+first_names <- read_csv("/Users/terencechau/Dropbox/Work/UChicago/RA/RA Hornbeck/CMF Patents/Terence Working Folders/output/name_assignments/first_names_1880.csv")
+
+last_names <- read_csv("/Users/terencechau/Dropbox/Work/UChicago/RA/RA Hornbeck/CMF Patents/Terence Working Folders/output/name_assignments/last_names_1880.csv")
+
+# Order of operations:
+# -Split name into tokens
+# -For each token:
+#   -Try to find match in both tables
+#   -If token shows up only in one table, assign that type
+#   -If token shows up in both tables, then it's the highest share type
+#   -If token shows up in neither table, take JW between token and both tables, assign type associated to name with lowest JW
+# -Check if tokens agree (not all are the same name type)
+#   -If they agree, assign name types as is, exit.
+# -If tokens disagree (all are the same type)
+#   -Assign highest share to type
+
+# Write helper functions:
+# Prep names into a tokenized list
+make_name_list <- function(names){
+  names %<>% tolower()
+  names <- strsplit(names, "\\s+")
+}
+
+return_exact_share <- function(token, table){
+  table %>% 
+    filter(name == token) %>% 
+    pull(share)
+}
+
+return_nearest_share <- function(token, table){
+  which_min_jw <- which.min(stringdist(token, table$name, method = "jw", p = 0.1))
+  nearest_token <- table[which_min_jw, ]
+  nearest_token$share
+}
+
+# Compare likelihood of first and last name when names are in both lists
+compare_exact_name <- function(token, 
+                               first_names_table = first_names, 
+                               last_names_table = last_names){
+  first_name_share <- return_exact_share(token, first_names)
+  last_name_share <- return_exact_share(token, last_names)
+  if (first_name_share >= last_name_share){
+    return("first")
+  } else {
+    return("last")
+  }
+}
+
+# When name isn't in either list, assign type of nearest name
+compare_nearest_name <- function(token){
+  first_name_share <- return_nearest_share(token, first_names)
+  last_name_share <- return_nearest_share(token, last_names)
+  if (first_name_share >= last_name_share){
+    return("first")
+  } else {
+    return("last")
+  }
+}
+
+# Out of several tokens, which is likelier to be the last name
+# Ignores initials
+likeliest_last_name <- function(token_vector){
+  singles <- which(nchar(token_vector) == 1)
+  if (!is_empty(singles)){
+    token_vector <- token_vector[-singles]
+  }
+  name <- make_name_list(token_vector)
+  last_name_likelihood <- sapply(name, function(token){
+    return_nearest_share(token, last_names)
+  })
+  token_vector[which.min(last_name_likelihood)]
+}
+
+# Write function that collects all these steps
+name_classifier <- function(names, 
+                            first_name_dist = first_names, 
+                            last_name_dist = last_names,
+                            drop_company_names = TRUE){
+  # Drop company identifiers
+  names <- gsub(pattern = "&|\\band\\b|\\bco\\b|\\bcompany\\b|\\bmanufacturing\\b|\\bmanfg\\b|\\bmnf\\b|\\bson\\b|\\bsons\\b|\\bbro\\b|\\bbros\\b|\\bbrothers\\b|\\bagricultural\\b|\\bmachine\\b", 
+             replacement = "", 
+             x = names,
+             ignore.case = TRUE)
+  names <- gsub(pattern = "\\.|\\?", replacement = " ", x = names)
+  names <- str_trim(names, side = "both")
+  names <- str_squish(names)
+  
+  # Split vector of names into a list of tokenized names
+  names <- make_name_list(names)
+  names <- lapply(names, function(name){
+    if (is_empty(name)){
+      return("")
+    } else {
+      return(name)
+    }
+  })
+  
+  # Get a list back where each token has a prediction
+  name_types <- lapply(names, function(name){
+    sapply(name, function(token){
+      # Deal with empty tokens
+      if (token == ""){
+        return("first")
+      }
+      
+      # Try to find match in both tables
+      in_first_names <- ifelse(any(token %in% first_names$name), TRUE, FALSE)
+      in_last_names <- ifelse(any(token %in% last_names$name), TRUE, FALSE)
+      
+      # If token shows up only in one table, assign that type
+      if (in_first_names & !in_last_names){
+        return("first")
+      } else if (!in_first_names & in_last_names){
+        return("last")
+      } else if (in_first_names & in_last_names){
+        # If token shows up in both tables, assign highest share type
+        return(compare_exact_name(token))
+      } else {
+        return(compare_nearest_name(token))
+      }
+    })
+  })
+  
+  # Join names and classifications
+  tokens_classified <- lapply(seq_along(names), function(i){
+    data.frame("token" = names[[i]], "name_type" = name_types[[i]])
+  })
+  
+  # Take list of N names and return an Nx2 dataframe with a first and last name 
+  # column
+  names_classified <- lapply(tokens_classified, function(name_df){
+    # Exceptions:
+    # Initials get assigned to first names, never last names
+    name_df %<>% mutate(name_type = ifelse(nchar(token) == 1, "first", name_type))
+    
+    # If there are only first or last names
+    # Get likelihood each token is each type and reassign (ignore initials)
+    # Assume there are more first name tokens than last name tokens if need be
+    all_one_type <- length(unique(name_df$name_type)) == 1 & nrow(name_df) > 1
+    if (all_one_type){
+      last_name <- likeliest_last_name(name_df$token)
+      if (!is_empty(last_name)){
+        name_df %<>% mutate(name_type = ifelse(token == last_name, "last", "first"))
+      } else {
+        # If the last name finding function doesn't return anything (e.g., all initials)
+        name_df <- bind_rows(name_df, data.frame("token" = NA, "name_type" = "last"))
+      }
+    }
+    
+    # If nothing is returned, fill
+    if (nrow(name_df) == 0){
+      name_df <- data.frame("token" = NA, "name_type" = NA)
+    }
+    
+    # If only one name is returned, fill the other one
+    only_last_name <- all(name_df$name_type == "last") & nrow(name_df) == 1
+    only_last_name <- ifelse(is.na(only_last_name), FALSE, only_last_name)
+    only_first_name <- all(name_df$name_type == "first") & nrow(name_df) == 1
+    only_first_name <- ifelse(is.na(only_first_name), FALSE, only_first_name)
+    
+    if (only_last_name){
+      name_df <- bind_rows(name_df, data.frame("token" = NA, "name_type" = "first"))
+    } else if (only_first_name) {
+      name_df <- bind_rows(name_df, data.frame("token" = NA, "name_type" = "last"))
+    }
+    
+    # Convert any empty tokens into NAs
+    name_df %<>% mutate(token = ifelse(token == "", NA, token))
+    
+    # Collapse names together to deal with multiple first or last names
+    name_df_collapsed <- name_df %>%
+      group_by(name_type) %>% 
+      summarize(name = paste(token, collapse = " "),
+                .groups = "keep") %>% 
+      ungroup()
+    
+    # Pivot wide
+    name_df_wide <- name_df_collapsed %>% 
+      pivot_wider(names_from = name_type, values_from = name)
+  }) %>% bind_rows()
+}
+```
+
+
+```{r}
+# Save each unique name-id pair for CMF and patents
+cmf_patents %<>%
+  mutate(establishment_name = tolower(establishment_name),
+         inventor_name = tolower(inventor_name),
+         assignee_name = tolower(assignee_name))
+
+cmf_names <- cmf_patents %>% 
+  select(establishment_name, id) %>% 
+  distinct() %>% 
+  drop_na()
+inventor_names <- cmf_patents %>% 
+  select(inventor_name, patent_number) %>% 
+  distinct() %>% 
+  drop_na()
+assignee_names <- cmf_patents %>% 
+  select(assignee_name, patent_number) %>% 
+  distinct() %>% 
+  drop_na()
+
+system.time({ 
+  cmf_names_split <- name_classifier(cmf_names$establishment_name, 
+                                     first_names, 
+                                     last_names)
+})
+
+cmf_names_split_with_id <- data.frame(cmf_names, cmf_names_split) 
+
+write_csv(cmf_names_split_with_id, 
+      "~/Dropbox/Work/UChicago/RA/RA Hornbeck/CMF Patents/Terence Working Folders/output/name_assignments/cmf_names_split.csv")
+
+system.time({ 
+  inventor_names_split <- name_classifier(inventor_names$inventor_name, 
+                                          first_names, 
+                                          last_names)
+})
+
+inventor_names_split_with_id <- data.frame(inventor_names, inventor_names_split)
+
+write_csv(inventor_names_split_with_id, 
+      "~/Dropbox/Work/UChicago/RA/RA Hornbeck/CMF Patents/Terence Working Folders/output/name_assignments/inventor_names_split.csv")
+
+system.time({ 
+  assignee_names_split <- name_classifier(assignee_names$assignee_name, 
+                                          first_names, 
+                                          last_names)
+})
+
+assignee_names_split_with_id <- data.frame(assignee_names, assignee_names_split) 
+
+write_csv(assignee_names_split_with_id, 
+      "~/Dropbox/Work/UChicago/RA/RA Hornbeck/CMF Patents/Terence Working Folders/output/name_assignments/assignee_names_split.csv")
+```
+
+# Using Split Names
+
+```{r}
+# Reload split names and merge in
+cmf_names_split_with_id <- read_csv("CMF Patents/Terence Working Folders/output/name_assignments/cmf_names_split.csv")
+inventor_names_split_with_id <- read_csv("CMF Patents/Terence Working Folders/output/name_assignments/inventor_names_split.csv")
+assignee_names_split_with_id <- read_csv("CMF Patents/Terence Working Folders/output/name_assignments/assignee_names_split.csv")
+
+cmf_patents %<>% 
+  mutate(establishment_name = tolower(establishment_name),
+         inventor_name = tolower(inventor_name),
+         assignee_name = tolower(assignee_name)) %>% 
+  left_join(cmf_names_split_with_id, by = c("establishment_name", "id")) %>% 
+  rename(establishment_name_first = first, 
+         establishment_name_last = last) %>% 
+  left_join(inventor_names_split_with_id, by = c("inventor_name", "patent_number")) %>% 
+  rename(inventor_name_first = first, 
+         inventor_name_last = last) %>% 
+  left_join(assignee_names_split_with_id, by = c("assignee_name", "patent_number")) %>% 
+  rename(assignee_name_first = first, 
+         assignee_name_last = last)
+```
+
+Trace back all the previous prep steps:
+
+## Find target names
+
+First, take a look at all the names and figure out the right orderings
+
+```{r}
+cmf_patents %<>% mutate(company_name = !proper_name(establishment_name))
+
+cmf_patents %<>% 
+    mutate(establishment_name_first = ifelse(is.na(establishment_name_first), 
+                                             "", establishment_name_first),
+           establishment_name_last = ifelse(is.na(establishment_name_last), 
+                                             "", establishment_name_last),
+           establishment_name_original = establishment_name,
+           establishment_name = ifelse(company_name == FALSE, 
+                                              paste(establishment_name_first, 
+                                                    establishment_name_last, 
+                                                    sep = " "), 
+                                              establishment_name)) 
+
+# If assignee is missing, make inventor the target (no inventors missing)
+cmf_patents %<>%
+  mutate(patent_target = ifelse(is.na(assignee_name), "inventor", NA))
+# sum(is.na(cmf_patents[which(is.na(cmf_patents$assignee_name)), ]$patent_target))
+
+# When assignee is not missing and establishment has person's name take smallest last name distance name
+cmf_patents %<>%
+  mutate(inventor_last_jw = stringdist(establishment_name_last, 
+                                       inventor_name_last, method = "jw", p = 0.1),
+         assignee_last_jw = stringdist(establishment_name_last, 
+                                       assignee_name_last, method = "jw", p = 0.1),
+         patent_target = ifelse(company_name == FALSE & 
+                                  !is.na(assignee_name) & 
+                                  inventor_last_jw > assignee_last_jw, 
+                                "assignee", patent_target),
+         patent_target = ifelse(company_name == FALSE & 
+                                  !is.na(assignee_name) & 
+                                  inventor_last_jw <= assignee_last_jw, 
+                                "inventor", patent_target),
+         patent_target = ifelse(company_name == FALSE &
+                                  !is.na(assignee_name) &
+                                  is.na(assignee_last_jw),
+                                "inventor", patent_target))
+# cmf_patents %>% filter(company_name == FALSE & !is.na(assignee_name)) %>% pull(patent_target) %>% is.na() %>% sum()
+
+# When assignee is not missing and establishment has company name take smallest patent last name to all tokens distance name
+per_token_jw_inventor <- calculate_per_token_jw(cmf_patents$establishment_name,
+                              cmf_patents$inventor_name_last)
+per_token_jw_assignee <- calculate_per_token_jw(cmf_patents$establishment_name,
+                              cmf_patents$assignee_name_last)
+# When inventor last name is missing, assign general per token JW
+missing_per_token_jw_inventor <- which(is.na(per_token_jw_inventor))
+per_token_jw_inventor_2 <- calculate_per_token_jw(cmf_patents$establishment_name[missing_per_token_jw_inventor],
+                                                cmf_patents$inventor_name[missing_per_token_jw_inventor])
+per_token_jw_inventor[missing_per_token_jw_inventor] <- per_token_jw_inventor_2
+cmf_patents %<>% data.frame("per_token_jw_inventor" = per_token_jw_inventor, 
+                            "per_token_jw_assignee" = per_token_jw_assignee) 
+
+cmf_patents %<>% 
+  mutate(patent_target = ifelse(company_name == TRUE &
+                                  !is.na(assignee_name) &
+                                  per_token_jw_inventor > per_token_jw_assignee,
+                                "assignee", patent_target),
+         patent_target = ifelse(company_name == TRUE &
+                                  !is.na(assignee_name) &
+                                  per_token_jw_inventor <= per_token_jw_assignee,
+                                "inventor", patent_target),
+         patent_target = ifelse(company_name == TRUE &
+                                  !is.na(assignee_name) &
+                                  is.na(per_token_jw_assignee),
+                                "inventor", patent_target))
+
+# Now that the patent target has been assigned, set the right variables with the prefix "patent_"
+cmf_patents %<>%
+  mutate(patent_name = ifelse(patent_target == "inventor", inventor_name, assignee_name),
+         patent_name_first = ifelse(patent_target == "inventor", inventor_name_first, assignee_name_first),
+         patent_name_last = ifelse(patent_target == "inventor", inventor_name_last, assignee_name_last),
+         patent_city = ifelse(patent_target == "inventor", inventor_city, assignee_city),
+         per_token_jw_name = ifelse(patent_target == "inventor", per_token_jw_inventor, per_token_jw_assignee))
+```
+
+Generate all other variables the other model had (we already have the per_token_jw)
+
+```{r}
+cmf_patents %<>% 
+  mutate(jw_name = stringdist(establishment_name, patent_name, method = "jw", p = 0.1),
+         post_office = tolower(post_office),
+         jw_city = stringdist(post_office, patent_city, method = "jw", p = 0.1),
+         patent_year = lubridate::year(disposal_date),
+         year_gap = year - patent_year)
+cmf_patents$mean_jw_name <- mean_jw(cmf_patents$establishment_name, 
+                                    cmf_patents$patent_name)
+cmf_patents$mean_jw_city <- mean_jw(cmf_patents$post_office, 
+                                    cmf_patents$patent_city)
+cmf_patents %<>%
+  mutate(mean_jw_city = ifelse(is.na(jw_city), NA, mean_jw_city))
+
+# Recode undetectable matches to not confuse the model
+cmf_patents %<>% 
+  mutate(match = ifelse(detectable == 0, 0, match),
+         match = as.factor(ifelse(match == 1, "1", "0")))
+```
+
+See if there appear to be any differences in the features vs baseline
+
+```{r}
+cmf_patents %>% 
+  filter(match == "1") %>% 
+  select(jw_name, mean_jw_name, per_token_jw_name, company_name,
+         jw_city, mean_jw_city, year_gap) %>% 
+  summary()
+```
+
+```{r}
+cmf_patents %>% 
+  filter(match == "0") %>% 
+  select(jw_name, mean_jw_name, per_token_jw_name, company_name,
+         jw_city, mean_jw_city, year_gap) %>% 
+  summary()
+```
+
+# Train
+
+Split the data using the same samples as the old file
+
+```{r}
+set.seed(60615)
+
+train_firms <- cmf_patents %>%
+ mutate(match = ifelse(match == "1", 1, 0)) %>% 
+ group_by(id) %>%
+ summarize(n = n(),
+           n_matches = sum(match)) %>%
+ slice_sample(prop = 1) %>%
+ mutate(cumulative_n = cumsum(n),
+        cumulative_matches = cumsum(n_matches),
+        total = sum(n),
+        total_matches = sum(n_matches),
+        share = cumulative_n/total,
+        share_matches = cumulative_matches/total_matches,
+        dataset = case_when(share_matches <= 0.7 ~ "train",
+                            share_matches > 0.7 & share_matches <= 0.85 ~ "validation",
+                            share_matches > 0.85 ~ "test",
+                            TRUE ~ as.character(NA)))
+
+train_firm_ids <- train_firms %>%
+ filter(dataset == "train") %>%
+ pull(id)
+
+val_firm_ids <- train_firms %>%
+ filter(dataset == "validation") %>%
+ pull(id)
+
+test_firm_ids <- train_firms %>%
+ filter(dataset == "test") %>%
+ pull(id)
+
+train <- cmf_patents %>%
+ filter(id %in% train_firm_ids)
+
+validation <- cmf_patents %>%
+ filter(id %in% val_firm_ids)
+
+test <- cmf_patents %>%
+ filter(id %in% test_firm_ids)
+
+table(train$match)
+table(validation$match)
+table(test$match)
+```
+
+Select same variables as the preferred specification in the last file
+
+```{r}
+# Get training data means of variables for imputation
+train_jw_city_mean <- mean(train$jw_city, na.rm = TRUE)
+train_mean_jw_city_mean <- mean(train$mean_jw_city, na.rm = TRUE)
+
+# Make missing flags and impute
+train %<>%
+  mutate(jw_city_miss = ifelse(is.na(jw_city), 1, 0),
+         jw_city = ifelse(is.na(jw_city), 
+                          train_jw_city_mean, 
+                          jw_city),
+         mean_jw_city_miss = ifelse(is.na(mean_jw_city), 1, 0),
+         mean_jw_city = ifelse(is.na(mean_jw_city), 
+                               train_mean_jw_city_mean, 
+                               mean_jw_city))
+
+validation %<>%
+  mutate(jw_city_miss = ifelse(is.na(jw_city), 1, 0),
+         jw_city = ifelse(is.na(jw_city), 
+                          train_jw_city_mean, 
+                          jw_city),
+         mean_jw_city_miss = ifelse(is.na(mean_jw_city), 1, 0),
+         mean_jw_city = ifelse(is.na(mean_jw_city), 
+                               train_mean_jw_city_mean, 
+                               mean_jw_city))
+
+test %<>%
+  mutate(jw_city_miss = ifelse(is.na(jw_city), 1, 0),
+         jw_city = ifelse(is.na(jw_city), 
+                          train_jw_city_mean, 
+                          jw_city),
+         mean_jw_city_miss = ifelse(is.na(mean_jw_city), 1, 0),
+         mean_jw_city = ifelse(is.na(mean_jw_city), 
+                               train_mean_jw_city_mean, 
+                               mean_jw_city))
+
+model_variables <- c("match", "company_name", "uspc_class", "mean_jw_name", 
+                     "mean_jw_city", "jw_name", "jw_city", "year_gap", 
+                     "per_token_jw_name", "jw_city_miss", "mean_jw_city_miss")
+
+model_train <- train %>% 
+  select(all_of(model_variables)) %>% 
+  select(match, everything()) %>% 
+  mutate(across(where(is.character), as.factor))
+model_validation <- validation %>% 
+  select(all_of(model_variables)) %>% 
+  select(match, everything()) %>% 
+  mutate(across(where(is.character), as.factor))
+model_test <- test %>% 
+  select(all_of(model_variables)) %>% 
+  select(match, everything()) %>% 
+  mutate(across(where(is.character), as.factor))
+
+# Transform unseen factor levels in test to "" because the model won't know them
+factors <- c("uspc_class")
+
+unseen_val <- lapply(factors, function(x){
+  unseen_levels <- setdiff(levels(model_validation[, x]), levels(model_train[, x]))
+})
+for (i in seq_along(factors)){
+  levels(model_validation[, factors[i]])[which(levels(model_validation[, factors[i]]) %in% unseen_val[[i]])] <- ""
+}
+unseen_test <- lapply(factors, function(x){
+  unseen_levels <- setdiff(levels(model_test[, x]), levels(model_train[, x]))
+})
+for (i in seq_along(factors)){
+  levels(model_test[, factors[i]])[which(levels(model_test[, factors[i]]) %in% unseen_test[[i]])] <- ""
+}
+```
+
+Train a random forest:
+
+```{r, message=FALSE, warning=FALSE, results="hide"}
+rf <- ranger(match ~ ., 
+             data = model_train,
+             num.trees = 1000,
+             importance = "permutation")
+```
+
+Permutation variable importance:
+
+```{r}
+rf_importance <- importance(rf) %>% 
+  data.frame("Importance" = .) %>% 
+  arrange(-Importance)
+```
+
+```{r}
+preds_rf_train <- predict(rf, data = model_train)
+cm_rf_train <- table("Prediction" = preds_rf_train$predictions, 
+                     "Reference" = model_train$match)
+cm_rf_train
+```
+
+```{r}
+preds_rf_validation <- predict(rf, data = model_validation)
+cm_rf_validation <- table("Prediction" = preds_rf_validation$predictions, 
+                          "Reference" = model_validation$match)
+cm_rf_validation
+```
+
+For reference, the old validation CM was
+
+```{r}
+#           Reference
+# Prediction     0     1
+#          0 68307    16
+#          1     3    53
+```
+
+Pretty similar
+
+Train on the big dataset and check the actual test
+
+```{r, message=FALSE, warning=FALSE, results="hide"}
+big_train <- bind_rows(model_train, model_validation)
+rf <- ranger(match ~ ., 
+             data = big_train,
+             num.trees = 1000,
+             importance = "permutation")
+```
+
+Permutation variable importance:
+
+```{r}
+rf_importance <- importance(rf) %>% 
+  data.frame("Importance" = .) %>% 
+  arrange(-Importance)
+
+rf_importance_table <- rf_importance %>% 
+  rownames_to_column(var = "Variable") %>% 
+  kable(format = "latex",
+         booktabs = TRUE,
+         align = "lc") %>% 
+   kable_styling()
+
+rf_importance
+```
+
+```{r}
+preds_rf_train <- predict(rf, data = big_train)
+cm_rf_train <- table("Prediction" = preds_rf_train$predictions, 
+                     "Reference" = big_train$match)
+cm_rf_train
+```
+
+```{r}
+preds_rf_test <- predict(rf, data = model_test)
+cm_rf_test <- table("Prediction" = preds_rf_test$predictions, 
+                          "Reference" = model_test$match)
+cm_rf_test
+```
+
+Performance metrics
+
+```{r}
+# Define performance metric functions
+tpr <- function(cm){
+  cm[2, 2]/(sum(cm[, 2]))
+}
+
+tnr <- function(cm){
+  cm[1, 1]/(sum(cm[, 1]))
+}
+
+ppv <- function(cm){
+  cm[2, 2]/(sum(cm[2, ]))
+}
+
+f_score <- function(cm){
+  (2*tpr(cm) * ppv(cm))/(tpr(cm) + ppv(cm))
+}
+
+kappa <- function(cm){
+  n <- sum(cm)
+  p_o <- sum(diag(cm))/n
+  p_rpa <- (sum(cm[2, ]))/n * (sum(cm[, 2]))/n
+  p_rna <- (sum(cm[1, ]))/n * (sum(cm[, 1]))/n
+  p_r <- p_rpa + p_rna
+  (p_o - p_r)/(1 - p_r)
+}
+```
+
+```{r}
+tpr_rf <- tpr(cm_rf_test)
+tnr_rf <- tnr(cm_rf_test)
+ppv_rf <- ppv(cm_rf_test)
+f_rf <- f_score(cm_rf_test)
+kappa_rf <- kappa(cm_rf_test)
+
+tpr_rf
+tnr_rf
+ppv_rf
+f_rf
+kappa_rf
+```
+
+```{r}
+save.image("~/Dropbox/Work/UChicago/RA/RA Hornbeck/CMF Patents/Terence Working Folders/output/linkage_model_split_names.RData")
+```
+
+Plot Min JW
+
+```{r}
+per_token_jw_dist <- cmf_patents %>% 
+  ggplot(aes(x = per_token_jw_name, fill = match, color = match)) +
+  geom_density(alpha = 0.2) +
+  theme_light() +
+  labs(x = "Minimum Jaro-Winkler Distance", y = "Density", fill = "Match", 
+       color = "Match") +
+  scale_color_manual(values = c("darkorange2", "aquamarine3")) 
+
+ggsave(filename = "CMF Patents/Terence Working Folders/output/figures/per_token_jw_density_census.pdf", 
+       plot = per_token_jw_dist, width = 7, height = 4, units = "in")
+
+per_token_jw_dist
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
